@@ -1,1 +1,1 @@
-worker: python nifty_fut_trader.py
+worker: python nifty_fut_cgpt.py
