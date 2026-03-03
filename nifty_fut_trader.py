@@ -4,12 +4,15 @@ NIFTY FUT Automated Swing Trade Bot  —  ORB Breakout (Bullish + Bearish) with 
 =====================================================================================
 Railway.app deployment version
 - No CSV, No Flask, No Plotly
-- All trade data persisted to PostgreSQL via SQLAlchemy
+- Live/Paper trades  -> trades, swing_pivots, orb_snapshots, session_summaries
+- Backtest/Replay    -> backtest_trades, backtest_swing_pivots,
+                        backtest_orb_snapshots, backtest_session_summaries
 - Config via environment variables
+- Set FORCE_REPLAY=true in Railway Variables to trigger a backtest run
 """
 
 import sys, time, datetime, threading, logging, os, argparse
-from collections import defaultdict
+from collections import defaultdict as _dd
 
 try:
     from zoneinfo import ZoneInfo
@@ -39,7 +42,7 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # dotenv optional; env vars may be set directly
+    pass  # dotenv optional; env vars may be set directly in Railway Variables
 
 if missing:
     print(f"\n[ERR]  Run:  pip install {' '.join(missing)}\n"); sys.exit(1)
@@ -47,52 +50,53 @@ if missing:
 IST = ZoneInfo("Asia/Kolkata")
 
 # =============================================================================
-#  CONFIG  (all overridable via environment variables)
+#  CONFIG  (all overridable via Railway environment variables)
 # =============================================================================
 
 def _env(key, default):
     return os.environ.get(key, default)
-    
-FORCE_REPLAY = _env("FORCE_REPLAY", "false").lower() == "true"
 
-API_KEY          = _env("KITE_API_KEY",       "9qfecm39l1j64xyc")
-ACCESS_TOKEN     = _env("KITE_ACCESS_TOKEN",  "vWatt0tzpGWVsyl1Y8EnkNXgZoJwbRii")
-DATABASE_URL     = _env("DATABASE_URL",       "sqlite:///trades.db")  # Railway sets this automatically
+API_KEY          = _env("KITE_API_KEY",      "YOUR_API_KEY")
+ACCESS_TOKEN     = _env("KITE_ACCESS_TOKEN", "YOUR_ACCESS_TOKEN")
+DATABASE_URL     = _env("DATABASE_URL",      "sqlite:///trades.db")  # Railway sets automatically
 
 BASE_SYMBOL      = "NIFTY"
 EXCHANGE_FUT     = "NFO"
 PRODUCT          = "MIS"
 INTERVAL         = "minute"
 
-ORB_MINUTES      = int(_env("ORB_MINUTES",        "15"))
-PIVOT_LEFT       = int(_env("PIVOT_LEFT",          "2"))
-PIVOT_RIGHT      = int(_env("PIVOT_RIGHT",         "2"))
-MIN_PIVOT_DIST   = int(_env("MIN_PIVOT_DIST",      "15"))
-BREAK_BUFFER     = int(_env("BREAK_BUFFER",        "5"))
-RETEST_BUFFER    = int(_env("RETEST_BUFFER",       "5"))
-MIN_SETUP_POINTS = int(_env("MIN_SETUP_POINTS",    "15"))
-SL_BUFFER        = int(_env("SL_BUFFER",           "10"))
+ORB_MINUTES      = int(_env("ORB_MINUTES",       "15"))
+PIVOT_LEFT       = int(_env("PIVOT_LEFT",         "2"))
+PIVOT_RIGHT      = int(_env("PIVOT_RIGHT",        "2"))
+MIN_PIVOT_DIST   = int(_env("MIN_PIVOT_DIST",     "15"))
+BREAK_BUFFER     = int(_env("BREAK_BUFFER",       "5"))
+RETEST_BUFFER    = int(_env("RETEST_BUFFER",      "5"))
+MIN_SETUP_POINTS = int(_env("MIN_SETUP_POINTS",   "15"))
+SL_BUFFER        = int(_env("SL_BUFFER",          "10"))
 
-VWAP_SL_POINTS      = int(_env("VWAP_SL_POINTS",      "10"))
-VWAP_CONSEC_CLOSES  = int(_env("VWAP_CONSEC_CLOSES",   "3"))
+VWAP_SL_POINTS     = int(_env("VWAP_SL_POINTS",     "10"))
+VWAP_CONSEC_CLOSES = int(_env("VWAP_CONSEC_CLOSES",  "3"))
 
-LOTS             = int(_env("LOTS",            "1"))
-LOT_SIZE         = int(_env("LOT_SIZE",        "50"))
-ADD_LOTS         = int(_env("ADD_LOTS",        "1"))
-MAX_TOTAL_LOTS   = int(_env("MAX_TOTAL_LOTS",  "6"))
-MAX_SL_POINTS    = int(_env("MAX_SL_POINTS",   "300"))
-MAX_TRADES_DAY   = int(_env("MAX_TRADES_DAY",  "10"))
+LOTS           = int(_env("LOTS",           "1"))
+LOT_SIZE       = int(_env("LOT_SIZE",       "50"))
+ADD_LOTS       = int(_env("ADD_LOTS",       "1"))
+MAX_TOTAL_LOTS = int(_env("MAX_TOTAL_LOTS", "6"))
+MAX_SL_POINTS  = int(_env("MAX_SL_POINTS",  "300"))
+MAX_TRADES_DAY = int(_env("MAX_TRADES_DAY", "10"))
 
-SQUARE_OFF_TIME  = (int(_env("SQUARE_OFF_HOUR", "15")),
-                    int(_env("SQUARE_OFF_MIN",  "15")))
+SQUARE_OFF_TIME = (int(_env("SQUARE_OFF_HOUR", "15")),
+                   int(_env("SQUARE_OFF_MIN",  "15")))
 
-PAPER_TRADE      = _env("PAPER_TRADE", "true").lower() == "true"
+PAPER_TRADE  = _env("PAPER_TRADE",  "true").lower() == "true"
 
-FROM_DATE        = _env("FROM_DATE", "2026-02-12")
-TO_DATE          = _env("TO_DATE",   "2026-02-12")
-REPLAY_DELAY_S   = float(_env("REPLAY_DELAY_S", "0.05"))
+# ── Backtest controls ──────────────────────────────────────────────────────────
+# Toggle FORCE_REPLAY=true / false in Railway Variables — no redeploy needed.
+FORCE_REPLAY   = _env("FORCE_REPLAY", "false").lower() == "true"
+FROM_DATE      = _env("FROM_DATE", "2026-02-12")
+TO_DATE        = _env("TO_DATE",   "2026-02-12")
+REPLAY_DELAY_S = float(_env("REPLAY_DELAY_S", "0.0"))   # 0 = run as fast as possible
 
-LOG_FILE         = _env("LOG_FILE", "trader.log")
+LOG_FILE = _env("LOG_FILE", "trader.log")
 
 # =============================================================================
 #  LOGGING
@@ -119,21 +123,29 @@ log = logging.getLogger(__name__)
 
 # =============================================================================
 #  DATABASE MODELS
+#
+#  Live / Paper  ->  trades, swing_pivots, orb_snapshots, session_summaries
+#  Backtest      ->  backtest_trades, backtest_swing_pivots,
+#                    backtest_orb_snapshots, backtest_session_summaries
+#
+#  Schema is identical in both sets. The DB class routes writes to the correct
+#  set based on the is_backtest flag so the two datasets are never mixed.
 # =============================================================================
 
 Base = declarative_base()
 
+# ── LIVE / PAPER tables ───────────────────────────────────────────────────────
+
 class Trade(Base):
-    """One row per completed trade (entry + exit)."""
     __tablename__ = 'trades'
 
     id           = Column(Integer, primary_key=True, autoincrement=True)
-    trade_num    = Column(Integer, nullable=False)
-    session_date = Column(String(10), nullable=False, index=True)   # YYYY-MM-DD
-    mode         = Column(String(10), nullable=False)               # PAPER / LIVE / REPLAY
+    trade_num    = Column(Integer,    nullable=False)
+    session_date = Column(String(10), nullable=False, index=True)
+    mode         = Column(String(10), nullable=False)              # PAPER / LIVE
 
-    direction    = Column(String(4),  nullable=False)               # BUY / SELL
-    bias         = Column(String(10), nullable=False)               # BULLISH / BEARISH
+    direction    = Column(String(4),  nullable=False)              # BUY / SELL
+    bias         = Column(String(10), nullable=False)              # BULLISH / BEARISH
 
     entry_time   = Column(DateTime, nullable=False)
     entry_price  = Column(Float,    nullable=False)
@@ -149,21 +161,17 @@ class Trade(Base):
     pnl_points   = Column(Float,    nullable=True)
     pnl_rs       = Column(Float,    nullable=True)
 
-    reason       = Column(String(50), nullable=True)   # SL / TARGET / SQUARE_OFF / VWAP_SL / …
+    reason       = Column(String(50), nullable=True)
     day_pnl_rs   = Column(Float,    nullable=True)
 
     symbol       = Column(String(30), nullable=True)
     expiry       = Column(String(12), nullable=True)
-
-    # ORB context at entry
-    orb_high     = Column(Float, nullable=True)
-    orb_low      = Column(Float, nullable=True)
-
+    orb_high     = Column(Float,    nullable=True)
+    orb_low      = Column(Float,    nullable=True)
     created_at   = Column(DateTime, default=datetime.datetime.utcnow)
 
 
 class SwingPivot(Base):
-    """Every confirmed swing high/low detected during the session."""
     __tablename__ = 'swing_pivots'
 
     id           = Column(Integer, primary_key=True, autoincrement=True)
@@ -177,11 +185,10 @@ class SwingPivot(Base):
 
 
 class OrbSnapshot(Base):
-    """ORB data captured once per session after it forms."""
     __tablename__ = 'orb_snapshots'
 
     id           = Column(Integer, primary_key=True, autoincrement=True)
-    session_date = Column(String(10), nullable=False, unique=True)
+    session_date = Column(String(10), nullable=False, index=True)
     symbol       = Column(String(30), nullable=True)
     orb_high     = Column(Float,      nullable=False)
     orb_low      = Column(Float,      nullable=False)
@@ -191,22 +198,112 @@ class OrbSnapshot(Base):
 
 
 class SessionSummary(Base):
-    """One row per trading session, updated at end of day."""
     __tablename__ = 'session_summaries'
 
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    session_date   = Column(String(10), nullable=False, index=True)
+    symbol         = Column(String(30), nullable=True)
+    mode           = Column(String(10), nullable=False)
+    day_bias       = Column(String(10), nullable=True)
+    total_trades   = Column(Integer,    nullable=False, default=0)
+    winning_trades = Column(Integer,    nullable=False, default=0)
+    losing_trades  = Column(Integer,    nullable=False, default=0)
+    total_pnl_rs   = Column(Float,      nullable=False, default=0.0)
+    algo_dead      = Column(Boolean,    nullable=False, default=False)
+    created_at     = Column(DateTime,   default=datetime.datetime.utcnow)
+    updated_at     = Column(DateTime,   default=datetime.datetime.utcnow,
+                            onupdate=datetime.datetime.utcnow)
+
+
+# ── BACKTEST tables (identical columns + from_date / to_date metadata) ────────
+
+class BacktestTrade(Base):
+    __tablename__ = 'backtest_trades'
+
     id           = Column(Integer, primary_key=True, autoincrement=True)
-    session_date = Column(String(10), nullable=False, unique=True)
+    trade_num    = Column(Integer,    nullable=False)
+    session_date = Column(String(10), nullable=False, index=True)
+    mode         = Column(String(10), nullable=False)              # REPLAY
+
+    direction    = Column(String(4),  nullable=False)
+    bias         = Column(String(10), nullable=False)
+
+    entry_time   = Column(DateTime, nullable=False)
+    entry_price  = Column(Float,    nullable=False)
+    exit_time    = Column(DateTime, nullable=True)
+    exit_price   = Column(Float,    nullable=True)
+
+    sl_trigger   = Column(Float,    nullable=False)
+    target       = Column(Float,    nullable=False)
+    setup_size   = Column(Float,    nullable=True)
+
+    qty          = Column(Integer,  nullable=False)
+    lots         = Column(Integer,  nullable=False)
+    pnl_points   = Column(Float,    nullable=True)
+    pnl_rs       = Column(Float,    nullable=True)
+
+    reason       = Column(String(50), nullable=True)
+    day_pnl_rs   = Column(Float,    nullable=True)
+
     symbol       = Column(String(30), nullable=True)
-    mode         = Column(String(10), nullable=False)
-    day_bias     = Column(String(10), nullable=True)
-    total_trades = Column(Integer,    nullable=False, default=0)
-    winning_trades = Column(Integer,  nullable=False, default=0)
-    losing_trades  = Column(Integer,  nullable=False, default=0)
-    total_pnl_rs = Column(Float,      nullable=False, default=0.0)
-    algo_dead    = Column(Boolean,    nullable=False, default=False)
+    expiry       = Column(String(12), nullable=True)
+    orb_high     = Column(Float,    nullable=True)
+    orb_low      = Column(Float,    nullable=True)
+
+    # Backtest run metadata — lets you distinguish multiple runs on same dates
+    from_date    = Column(String(10), nullable=True)
+    to_date      = Column(String(10), nullable=True)
     created_at   = Column(DateTime,   default=datetime.datetime.utcnow)
-    updated_at   = Column(DateTime,   default=datetime.datetime.utcnow,
-                          onupdate=datetime.datetime.utcnow)
+
+
+class BacktestSwingPivot(Base):
+    __tablename__ = 'backtest_swing_pivots'
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    session_date = Column(String(10), nullable=False, index=True)
+    pivot_type   = Column(String(4),  nullable=False)
+    candle_time  = Column(DateTime,   nullable=False)
+    candle_idx   = Column(Integer,    nullable=False)
+    price        = Column(Float,      nullable=False)
+    symbol       = Column(String(30), nullable=True)
+    from_date    = Column(String(10), nullable=True)
+    to_date      = Column(String(10), nullable=True)
+    created_at   = Column(DateTime,   default=datetime.datetime.utcnow)
+
+
+class BacktestOrbSnapshot(Base):
+    __tablename__ = 'backtest_orb_snapshots'
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    session_date = Column(String(10), nullable=False, index=True)
+    symbol       = Column(String(30), nullable=True)
+    orb_high     = Column(Float,      nullable=False)
+    orb_low      = Column(Float,      nullable=False)
+    orb_open     = Column(Float,      nullable=False)
+    formed_at    = Column(DateTime,   nullable=False)
+    from_date    = Column(String(10), nullable=True)
+    to_date      = Column(String(10), nullable=True)
+    created_at   = Column(DateTime,   default=datetime.datetime.utcnow)
+
+
+class BacktestSessionSummary(Base):
+    __tablename__ = 'backtest_session_summaries'
+
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    session_date   = Column(String(10), nullable=False, index=True)
+    symbol         = Column(String(30), nullable=True)
+    mode           = Column(String(10), nullable=False)
+    day_bias       = Column(String(10), nullable=True)
+    total_trades   = Column(Integer,    nullable=False, default=0)
+    winning_trades = Column(Integer,    nullable=False, default=0)
+    losing_trades  = Column(Integer,    nullable=False, default=0)
+    total_pnl_rs   = Column(Float,      nullable=False, default=0.0)
+    algo_dead      = Column(Boolean,    nullable=False, default=False)
+    from_date      = Column(String(10), nullable=True)
+    to_date        = Column(String(10), nullable=True)
+    created_at     = Column(DateTime,   default=datetime.datetime.utcnow)
+    updated_at     = Column(DateTime,   default=datetime.datetime.utcnow,
+                            onupdate=datetime.datetime.utcnow)
 
 
 # =============================================================================
@@ -214,38 +311,58 @@ class SessionSummary(Base):
 # =============================================================================
 
 class DB:
-    def __init__(self, url: str):
-        # NullPool is recommended for Railway to avoid connection leaks
+    """
+    Routes all writes to either the live tables or the backtest tables
+    depending on is_backtest.
+
+        DB(url, is_backtest=False)  ->  trades, swing_pivots, …
+        DB(url, is_backtest=True)   ->  backtest_trades, backtest_swing_pivots, …
+    """
+
+    def __init__(self, url: str, is_backtest: bool = False):
+        self.is_backtest = is_backtest
         connect_args = {}
         if url.startswith("sqlite"):
             connect_args = {"check_same_thread": False}
         self.engine = create_engine(
             url,
-            poolclass=NullPool,
-            connect_args=connect_args,
-            echo=False
+            poolclass    = NullPool,
+            connect_args = connect_args,
+            echo         = False
         )
         Base.metadata.create_all(self.engine)
-        log.info(f"[DB] Connected — tables ready ({url[:40]}...)")
+        label = "BACKTEST tables" if is_backtest else "LIVE tables"
+        log.info(f"[DB] Connected — {label} ready  ({url[:55]}...)")
+
+    # ── Model routing helpers ─────────────────────────────────────────────────
+
+    def _trade_cls(self):   return BacktestTrade          if self.is_backtest else Trade
+    def _pivot_cls(self):   return BacktestSwingPivot     if self.is_backtest else SwingPivot
+    def _orb_cls(self):     return BacktestOrbSnapshot    if self.is_backtest else OrbSnapshot
+    def _summary_cls(self): return BacktestSessionSummary if self.is_backtest else SessionSummary
+
+    def _extra(self) -> dict:
+        """Extra columns that only exist on backtest models."""
+        return {'from_date': FROM_DATE, 'to_date': TO_DATE} if self.is_backtest else {}
 
     # ── Trades ────────────────────────────────────────────────────────────────
 
     def log_trade(self, trade_num: int, t: dict, day_pnl: float,
                   mode: str, symbol: str, expiry, session_date: str,
                   orb_high: float, orb_low: float):
-        pnl_pts = (
-            round(t['entry_price'] - t['exit_price'], 2)
-            if t['direction'] == 'SELL'
-            else round(t['exit_price'] - t['entry_price'], 2)
-        )
-        exit_dt = t['exit_dt']
-        if hasattr(exit_dt, 'tzinfo') and exit_dt.tzinfo:
-            exit_dt = exit_dt.replace(tzinfo=None)
+
+        pnl_pts  = (round(t['entry_price'] - t['exit_price'], 2)
+                    if t['direction'] == 'SELL'
+                    else round(t['exit_price'] - t['entry_price'], 2))
+        exit_dt  = t['exit_dt']
         entry_dt = t['entry_dt']
+        if hasattr(exit_dt,  'tzinfo') and exit_dt.tzinfo:
+            exit_dt  = exit_dt.replace(tzinfo=None)
         if hasattr(entry_dt, 'tzinfo') and entry_dt.tzinfo:
             entry_dt = entry_dt.replace(tzinfo=None)
 
-        row = Trade(
+        cls    = self._trade_cls()
+        kwargs = dict(
             trade_num    = trade_num,
             session_date = session_date,
             mode         = mode,
@@ -261,43 +378,45 @@ class DB:
             qty          = t.get('qty', 0),
             lots         = t.get('qty', 0) // LOT_SIZE if LOT_SIZE else 0,
             pnl_points   = pnl_pts,
-            pnl_rs       = round(t['pnl'],  2),
+            pnl_rs       = round(t['pnl'],   2),
             reason       = t['reason'],
-            day_pnl_rs   = round(day_pnl,   2),
+            day_pnl_rs   = round(day_pnl,    2),
             symbol       = symbol,
             expiry       = str(expiry) if expiry else None,
             orb_high     = round(orb_high, 2) if orb_high else None,
             orb_low      = round(orb_low,  2) if orb_low  else None,
+            **self._extra()
         )
         with Session(self.engine) as s:
-            s.add(row)
+            s.add(cls(**kwargs))
             s.commit()
-        log.info(f"[DB] Trade #{trade_num} saved  (PnL Rs.{row.pnl_rs:+,.0f})")
+        tag = '[BT]' if self.is_backtest else '[DB]'
+        log.info(f"{tag} Trade #{trade_num} -> {cls.__tablename__}  "
+                 f"PnL Rs.{kwargs['pnl_rs']:+,.0f}")
 
     # ── Swing Pivots ──────────────────────────────────────────────────────────
 
     def log_pivot(self, pivot_type: str, candle_dt: datetime.datetime,
                   candle_idx: int, price: float,
                   symbol: str, session_date: str):
-        """Insert if not already present (idempotent by candle_time + type)."""
+        cls = self._pivot_cls()
+        dup_filter = dict(session_date=session_date,
+                          pivot_type=pivot_type,
+                          candle_idx=candle_idx)
+        if self.is_backtest:
+            dup_filter['from_date'] = FROM_DATE
+
         with Session(self.engine) as s:
-            exists = (
-                s.query(SwingPivot)
-                .filter_by(
-                    session_date=session_date,
-                    pivot_type=pivot_type,
-                    candle_idx=candle_idx
-                ).first()
-            )
-            if not exists:
+            if not s.query(cls).filter_by(**dup_filter).first():
                 ct = candle_dt.replace(tzinfo=None) if getattr(candle_dt, 'tzinfo', None) else candle_dt
-                s.add(SwingPivot(
+                s.add(cls(
                     session_date = session_date,
                     pivot_type   = pivot_type,
                     candle_time  = ct,
                     candle_idx   = candle_idx,
                     price        = round(price, 2),
                     symbol       = symbol,
+                    **self._extra()
                 ))
                 s.commit()
 
@@ -306,20 +425,27 @@ class DB:
     def log_orb(self, session_date: str, symbol: str,
                 orb_high: float, orb_low: float, orb_open: float,
                 formed_at: datetime.datetime):
+        cls        = self._orb_cls()
+        dup_filter = dict(session_date=session_date)
+        if self.is_backtest:
+            dup_filter.update(from_date=FROM_DATE, to_date=TO_DATE)
+
         with Session(self.engine) as s:
-            exists = s.query(OrbSnapshot).filter_by(session_date=session_date).first()
-            if not exists:
+            if not s.query(cls).filter_by(**dup_filter).first():
                 fa = formed_at.replace(tzinfo=None) if getattr(formed_at, 'tzinfo', None) else formed_at
-                s.add(OrbSnapshot(
+                s.add(cls(
                     session_date = session_date,
                     symbol       = symbol,
                     orb_high     = round(orb_high, 2),
                     orb_low      = round(orb_low,  2),
                     orb_open     = round(orb_open, 2),
                     formed_at    = fa,
+                    **self._extra()
                 ))
                 s.commit()
-                log.info(f"[DB] ORB saved  H:{orb_high:.2f}  L:{orb_low:.2f}")
+                tag = '[BT]' if self.is_backtest else '[DB]'
+                log.info(f"{tag} ORB -> {cls.__tablename__}  "
+                         f"H:{orb_high:.2f}  L:{orb_low:.2f}")
 
     # ── Session Summary ───────────────────────────────────────────────────────
 
@@ -329,8 +455,14 @@ class DB:
                                 trade_log: list):
         wins   = sum(1 for t in trade_log if t['pnl'] >= 0)
         losses = sum(1 for t in trade_log if t['pnl'] <  0)
+        cls    = self._summary_cls()
+
+        dup_filter = dict(session_date=session_date)
+        if self.is_backtest:
+            dup_filter.update(from_date=FROM_DATE, to_date=TO_DATE)
+
         with Session(self.engine) as s:
-            row = s.query(SessionSummary).filter_by(session_date=session_date).first()
+            row = s.query(cls).filter_by(**dup_filter).first()
             if row:
                 row.total_trades   = total_trades
                 row.winning_trades = wins
@@ -340,7 +472,7 @@ class DB:
                 row.day_bias       = day_bias
                 row.updated_at     = datetime.datetime.utcnow()
             else:
-                s.add(SessionSummary(
+                s.add(cls(
                     session_date   = session_date,
                     symbol         = symbol,
                     mode           = mode,
@@ -350,16 +482,20 @@ class DB:
                     losing_trades  = losses,
                     total_pnl_rs   = round(total_pnl, 2),
                     algo_dead      = algo_dead,
+                    **self._extra()
                 ))
             s.commit()
-        log.info(f"[DB] Session summary upserted  trades:{total_trades}  PnL:Rs.{total_pnl:+,.0f}")
+
+        tag = '[BT]' if self.is_backtest else '[DB]'
+        log.info(f"{tag} Session summary -> {cls.__tablename__}  "
+                 f"trades:{total_trades}  PnL:Rs.{total_pnl:+,.0f}")
 
 
 # =============================================================================
 #  AUTO-DETECT CURRENT MONTH NIFTY FUT
 # =============================================================================
 
-_INSTR_CACHE = {"ts": None, "data": None}
+_INSTR_CACHE: dict = {"ts": None, "data": None}
 
 def _get_instruments_cached(kite, exchange: str):
     if _INSTR_CACHE["data"] is None:
@@ -371,7 +507,7 @@ def _get_instruments_cached(kite, exchange: str):
 
 
 def get_current_month_nifty_future(kite):
-    today      = datetime.datetime.now(IST).date()
+    today       = datetime.datetime.now(IST).date()
     instruments = _get_instruments_cached(kite, EXCHANGE_FUT)
 
     futs = [
@@ -381,17 +517,14 @@ def get_current_month_nifty_future(kite):
         and i.get("expiry") is not None
         and i["expiry"]     >= today
     ]
-
     if not futs:
-        raise RuntimeError("No NIFTY FUT contracts found in instruments().")
+        raise RuntimeError("No NIFTY FUT contracts found.")
 
     futs.sort(key=lambda x: x["expiry"])
     c = futs[0]
-
     log.info("=" * 62)
     log.info(f"[FUT] Selected: {c['tradingsymbol']}  Expiry: {c['expiry']}")
     log.info("=" * 62)
-
     return int(c["instrument_token"]), str(c["tradingsymbol"]), c["expiry"]
 
 
@@ -399,20 +532,18 @@ def get_current_month_nifty_future(kite):
 #  VWAP
 # =============================================================================
 
-def compute_vwap_series(candles: list):
+def compute_vwap_series(candles: list) -> list:
     if not candles:
         return []
     cum_pv = 0.0
     cum_v  = 0.0
     out    = []
     for c in candles:
-        v = float(c.get('volume', 0) or 0)
-        if v <= 0:
-            v = 1.0
+        v  = float(c.get('volume', 0) or 0) or 1.0
         tp = (float(c['high']) + float(c['low']) + float(c['close'])) / 3.0
         cum_pv += tp * v
         cum_v  += v
-        out.append(cum_pv / cum_v if cum_v else float(c['close']))
+        out.append(cum_pv / cum_v)
     return out
 
 
@@ -446,9 +577,9 @@ def detect_pivots(candles: list, left: int, right: int,
         opp_set = {p['idx'] for p in (opposite or [])}
         out = [pivots[0]]
         for p in pivots[1:]:
-            last = out[-1]
-            dist = abs(p['price'] - last['price'])
-            has_opp = any(last['idx'] < oi < p['idx'] for oi in opp_set)
+            last     = out[-1]
+            dist     = abs(p['price'] - last['price'])
+            has_opp  = any(last['idx'] < oi < p['idx'] for oi in opp_set)
             if dist < min_dist and not has_opp:
                 if keep == 'high' and p['price'] > last['price']: out[-1] = p
                 elif keep == 'low' and p['price'] < last['price']: out[-1] = p
@@ -509,9 +640,7 @@ class PivotRegistry:
         known = {p['idx'] for p in self._pivots}
         for p in all_pivots:
             if p['idx'] not in known:
-                self._pivots.append({'price': p['price'],
-                                     'idx':   p['idx'],
-                                     'dt':    p['dt']})
+                self._pivots.append({'price': p['price'], 'idx': p['idx'], 'dt': p['dt']})
 
     def next_entry_level(self, close: float, origin_idx: int,
                          origin_price: float, last_used_price: float,
@@ -537,14 +666,9 @@ class PivotRegistry:
             ]
             return max(candidates, key=lambda p: p['price']) if candidates else None
 
-    def all_highs(self):
-        return list(self._pivots) if self._type == 'high' else []
-
-    def all_lows(self):
-        return list(self._pivots) if self._type == 'low' else []
-
-    def reset(self):
-        self._pivots = []
+    def all_highs(self): return list(self._pivots) if self._type == 'high' else []
+    def all_lows(self):  return list(self._pivots) if self._type == 'low'  else []
+    def reset(self):     self._pivots = []
 
 
 # =============================================================================
@@ -597,14 +721,12 @@ class TradeState:
         self.origin_idx   = idx
         self.origin_type  = pivot_type
         self._last_skip_price = None
-        label = 'swing LOW' if pivot_type == 'low' else 'swing HIGH'
-        log.info(f"[ARM] {label} armed — origin {price:.2f}  (candle #{idx})")
+        log.info(f"[ARM] {'swing LOW' if pivot_type=='low' else 'swing HIGH'} "
+                 f"armed — origin {price:.2f}  (candle #{idx})")
 
     def disarm(self, reason: str = ''):
-        self.armed        = False
-        self.origin_price = None
-        self.origin_idx   = None
-        self.origin_type  = None
+        self.armed = False
+        self.origin_price = self.origin_idx = self.origin_type = None
         self._last_skip_price = None
         if reason:
             log.info(f"[DISARM] {reason}")
@@ -660,12 +782,9 @@ class StrategyCore:
         self.expiry       = expiry
         self.db           = db
         self.session_date = session_date or datetime.datetime.now(IST).strftime('%Y-%m-%d')
-
-        # Track which pivots we've already persisted to avoid duplicate writes
         self._logged_pivot_indices: set = set()
 
     def _persist_pivots(self, pivots: dict):
-        """Persist any new swing highs/lows to DB."""
         if not self.db:
             return
         for p in (pivots.get('all_highs') or []):
@@ -707,7 +826,7 @@ class StrategyCore:
                     orb_high     = state.orb_high,
                     orb_low      = state.orb_low,
                     orb_open     = orb['open'],
-                    formed_at    = candle['dt']
+                    formed_at    = candle['dt'],
                 )
 
         if state.algo_dead:
@@ -719,16 +838,13 @@ class StrategyCore:
         self._persist_pivots(pivots)
 
         vwap_series = compute_vwap_series(candles[:candle_idx + 1])
-        vwap = vwap_series[-1] if vwap_series else None
+        vwap        = vwap_series[-1] if vwap_series else None
 
         if state.status == TradeState.OPEN:
-            result = self._check_invalidation(candle)
-            if result: return result
-
-            vwap_res = self._check_vwap_stop(candle, close, vwap)
-            if vwap_res:
-                return vwap_res
-
+            r = self._check_invalidation(candle)
+            if r: return r
+            r = self._check_vwap_stop(candle, close, vwap)
+            if r: return r
             self._maybe_add(candle, candle_idx, close, pivots)
             return self._check_exit(candle)
 
@@ -747,8 +863,7 @@ class StrategyCore:
 
         if state.day_bias == 'BEARISH':
             last_low = pivots['last_low']
-            if last_low is None:
-                return 'NO_PIVOT_LOW'
+            if last_low is None: return 'NO_PIVOT_LOW'
             if state.origin_idx != last_low['idx']:
                 state.arm(last_low['price'], last_low['idx'], 'low')
                 return 'SWING_LOW_ARMED'
@@ -757,8 +872,7 @@ class StrategyCore:
 
         elif state.day_bias == 'BULLISH':
             last_high = pivots['last_high']
-            if last_high is None:
-                return 'NO_PIVOT_HIGH'
+            if last_high is None: return 'NO_PIVOT_HIGH'
             if state.origin_idx != last_high['idx']:
                 state.arm(last_high['price'], last_high['idx'], 'high')
                 return 'SWING_HIGH_ARMED'
@@ -767,27 +881,22 @@ class StrategyCore:
 
         return 'WAITING_SETUP'
 
-    # ──────────────────────────────────────────────────────────────────────────
-    #  VWAP STOP
-    # ──────────────────────────────────────────────────────────────────────────
+    # ── VWAP STOP ────────────────────────────────────────────────────────────
+
     def _check_vwap_stop(self, candle, close: float, vwap: float):
         s = self.state
-        if vwap is None:
-            return None
+        if vwap is None: return None
 
         if s.direction == 'BUY':
             threshold = vwap - VWAP_SL_POINTS
             if close < threshold:
                 s.vwap_breach_count += 1
-                s.last_vwap_side = 'BELOW'
                 log.info(f"[VWAP] BUY breach {s.vwap_breach_count}/{VWAP_CONSEC_CLOSES}  "
                          f"close {close:.2f} < {threshold:.2f}")
             else:
                 s.vwap_breach_count = 0
-                s.last_vwap_side = None
-
             if s.vwap_breach_count >= VWAP_CONSEC_CLOSES:
-                log.warning(f"[VWAP_SL] BUY: EXIT + ALGO DEAD.")
+                log.warning("[VWAP_SL] BUY: EXIT + ALGO DEAD")
                 self._exit(candle['dt'], close, 'VWAP_SL')
                 s.algo_dead = True
                 return 'VWAP_SL_EXIT_DEAD'
@@ -796,58 +905,42 @@ class StrategyCore:
             threshold = vwap + VWAP_SL_POINTS
             if close > threshold:
                 s.vwap_breach_count += 1
-                s.last_vwap_side = 'ABOVE'
                 log.info(f"[VWAP] SELL breach {s.vwap_breach_count}/{VWAP_CONSEC_CLOSES}  "
                          f"close {close:.2f} > {threshold:.2f}")
             else:
                 s.vwap_breach_count = 0
-                s.last_vwap_side = None
-
             if s.vwap_breach_count >= VWAP_CONSEC_CLOSES:
-                log.warning(f"[VWAP_SL] SELL: EXIT + ALGO DEAD.")
+                log.warning("[VWAP_SL] SELL: EXIT + ALGO DEAD")
                 self._exit(candle['dt'], close, 'VWAP_SL')
                 s.algo_dead = True
                 return 'VWAP_SL_EXIT_DEAD'
 
         return None
 
-    # ──────────────────────────────────────────────────────────────────────────
-    #  INVALIDATION
-    # ──────────────────────────────────────────────────────────────────────────
+    # ── INVALIDATION ─────────────────────────────────────────────────────────
+
     def _check_invalidation(self, candle):
         state = self.state
         close = candle['close']
-
-        if state.day_bias == 'BEARISH':
-            if state.orb_high is not None and close > state.orb_high:
-                log.warning(
-                    f"[INVALIDATION] BEARISH: close {close:.2f} > "
-                    f"ORB HIGH {state.orb_high:.2f} — EXIT ALL, ALGO DEAD")
-                self._exit(candle['dt'], close, 'ORB_HIGH_BREAK_ALGO_DEAD')
-                state.algo_dead = True
-                return 'INVALIDATION_DEAD'
-
-        elif state.day_bias == 'BULLISH':
-            if state.orb_low is not None and close < state.orb_low:
-                log.warning(
-                    f"[INVALIDATION] BULLISH: close {close:.2f} < "
-                    f"ORB LOW {state.orb_low:.2f} — EXIT ALL, ALGO DEAD")
-                self._exit(candle['dt'], close, 'ORB_LOW_BREAK_ALGO_DEAD')
-                state.algo_dead = True
-                return 'INVALIDATION_DEAD'
-
+        if state.day_bias == 'BEARISH' and state.orb_high and close > state.orb_high:
+            log.warning(f"[INVALIDATION] BEARISH: close {close:.2f} > ORB HIGH {state.orb_high:.2f}")
+            self._exit(candle['dt'], close, 'ORB_HIGH_BREAK_ALGO_DEAD')
+            state.algo_dead = True
+            return 'INVALIDATION_DEAD'
+        if state.day_bias == 'BULLISH' and state.orb_low and close < state.orb_low:
+            log.warning(f"[INVALIDATION] BULLISH: close {close:.2f} < ORB LOW {state.orb_low:.2f}")
+            self._exit(candle['dt'], close, 'ORB_LOW_BREAK_ALGO_DEAD')
+            state.algo_dead = True
+            return 'INVALIDATION_DEAD'
         return None
 
-    # ──────────────────────────────────────────────────────────────────────────
-    #  ENTRY — BEARISH
-    # ──────────────────────────────────────────────────────────────────────────
+    # ── ENTRIES ───────────────────────────────────────────────────────────────
+
     def _check_sell_entry(self, candle, candle_idx, close) -> str:
         state = self.state
-
-        sh = state.sh_registry.next_entry_level(
+        sh    = state.sh_registry.next_entry_level(
             close=close, origin_idx=state.origin_idx,
-            origin_price=state.origin_price,
-            last_used_price=0.0, used_prices=set()
+            origin_price=state.origin_price, last_used_price=0.0, used_prices=set()
         )
         if sh is None: return 'ARMED_WATCHING'
 
@@ -864,31 +957,22 @@ class StrategyCore:
         if sl_dist <= 0: return 'SL_INVALID'
         if sl_dist > MAX_SL_POINTS: return 'SL_TOO_WIDE'
 
-        target = state.origin_price
-
         log.info("=" * 62)
         log.info(f"[SELL] BEARISH ENTRY  [{candle['dt'].strftime('%H:%M')}]  {self.symbol}")
-        log.info(f"   Close      : {close:.2f}")
-        log.info(f"   Swing High : {sh['price']:.2f}  (formed {sh['dt'].strftime('%H:%M')})")
-        log.info(f"   SL         : {sl_trigger:.2f}")
-        log.info(f"   Target     : {target:.2f}")
-        log.info(f"   Setup size : {setup_size:.1f} pts")
-        log.info(f"   Risk/lot   : Rs.{sl_dist * LOT_SIZE:,.0f}")
+        log.info(f"   Close:{close:.2f}  SH:{sh['price']:.2f}  "
+                 f"SL:{sl_trigger:.2f}  T:{state.origin_price:.2f}  "
+                 f"Setup:{setup_size:.1f}pts")
         log.info("=" * 62)
 
         state.disarm('sell entry taken')
-        self._place_order(candle, 'SELL', close, sl_trigger, target,
+        self._place_order(candle, 'SELL', close, sl_trigger, state.origin_price,
                           candle_idx, is_add=False,
                           pivot_price_used=sh['price'], setup_size=setup_size)
         return 'SELL_ENTRY'
 
-    # ──────────────────────────────────────────────────────────────────────────
-    #  ENTRY — BULLISH
-    # ──────────────────────────────────────────────────────────────────────────
     def _check_buy_entry(self, candle, candle_idx, close) -> str:
         state = self.state
-
-        sl = state.sl_registry.next_entry_level(
+        sl    = state.sl_registry.next_entry_level(
             close=close, origin_idx=state.origin_idx,
             origin_price=state.origin_price,
             last_used_price=float('inf'), used_prices=set()
@@ -908,113 +992,98 @@ class StrategyCore:
         if sl_dist <= 0: return 'SL_INVALID'
         if sl_dist > MAX_SL_POINTS: return 'SL_TOO_WIDE'
 
-        target = state.origin_price
-
         log.info("=" * 62)
         log.info(f"[BUY]  BULLISH ENTRY  [{candle['dt'].strftime('%H:%M')}]  {self.symbol}")
-        log.info(f"   Close      : {close:.2f}")
-        log.info(f"   Swing Low  : {sl['price']:.2f}  (formed {sl['dt'].strftime('%H:%M')})")
-        log.info(f"   SL         : {sl_trigger:.2f}")
-        log.info(f"   Target     : {target:.2f}")
-        log.info(f"   Setup size : {setup_size:.1f} pts")
-        log.info(f"   Risk/lot   : Rs.{sl_dist * LOT_SIZE:,.0f}")
+        log.info(f"   Close:{close:.2f}  SL:{sl['price']:.2f}  "
+                 f"SL_trig:{sl_trigger:.2f}  T:{state.origin_price:.2f}  "
+                 f"Setup:{setup_size:.1f}pts")
         log.info("=" * 62)
 
         state.disarm('buy entry taken')
-        self._place_order(candle, 'BUY', close, sl_trigger, target,
+        self._place_order(candle, 'BUY', close, sl_trigger, state.origin_price,
                           candle_idx, is_add=False,
                           pivot_price_used=sl['price'], setup_size=setup_size)
         return 'BUY_ENTRY'
 
-    # ──────────────────────────────────────────────────────────────────────────
-    #  SCALING
-    # ──────────────────────────────────────────────────────────────────────────
+    # ── SCALING ───────────────────────────────────────────────────────────────
+
     def _maybe_add(self, candle, candle_idx, close, pivots):
-        state = self.state
+        state        = self.state
         current_lots = state.total_qty // LOT_SIZE if LOT_SIZE else 0
-        if current_lots >= MAX_TOTAL_LOTS:
-            return
+        if current_lots >= MAX_TOTAL_LOTS: return
 
         origin_price = state.target_price
         origin_idx   = state.entry_candle if state.entry_candle is not None else candle_idx
 
         if state.direction == 'SELL':
             sh = state.sh_registry.next_entry_level(
-                close=close, origin_idx=origin_idx,
-                origin_price=origin_price,
+                close=close, origin_idx=origin_idx, origin_price=origin_price,
                 last_used_price=state.last_added_price + 0.0001,
                 used_prices=state.used_prices_in_trade
             )
             if sh is None: return
             new_sl = sh['price'] + SL_BUFFER
-            log.info(f"[ADD-SELL] SH {sh['price']:.2f} reached -> add {ADD_LOTS} lot(s)  new SL:{new_sl:.2f}")
+            log.info(f"[ADD-SELL] SH {sh['price']:.2f}  new SL:{new_sl:.2f}")
             self._place_order(candle, 'SELL', close, new_sl, state.target_price,
                               candle_idx, is_add=True,
                               pivot_price_used=sh['price'], setup_size=0.0)
 
         elif state.direction == 'BUY':
             sl = state.sl_registry.next_entry_level(
-                close=close, origin_idx=origin_idx,
-                origin_price=origin_price,
+                close=close, origin_idx=origin_idx, origin_price=origin_price,
                 last_used_price=state.last_added_price - 0.0001,
                 used_prices=state.used_prices_in_trade
             )
             if sl is None: return
             new_sl = sl['price'] - SL_BUFFER
-            log.info(f"[ADD-BUY]  SL {sl['price']:.2f} reached -> add {ADD_LOTS} lot(s)  new SL:{new_sl:.2f}")
+            log.info(f"[ADD-BUY]  SL {sl['price']:.2f}  new SL:{new_sl:.2f}")
             self._place_order(candle, 'BUY', close, new_sl, state.target_price,
                               candle_idx, is_add=True,
                               pivot_price_used=sl['price'], setup_size=0.0)
 
-    # ──────────────────────────────────────────────────────────────────────────
-    #  EXIT CHECK
-    # ──────────────────────────────────────────────────────────────────────────
+    # ── EXIT CHECK ────────────────────────────────────────────────────────────
+
     def _check_exit(self, candle) -> str:
         close = candle['close']
         state = self.state
 
         if state.direction == 'SELL':
             if close >= state.sl_trigger:
-                log.warning(f"[SL] SELL [{candle['dt'].strftime('%H:%M')}]  close {close:.2f} >= SL {state.sl_trigger:.2f}")
-                self._exit(candle['dt'], close, 'SL')
-                return 'SL_EXIT'
+                log.warning(f"[SL] SELL  close {close:.2f} >= SL {state.sl_trigger:.2f}")
+                self._exit(candle['dt'], close, 'SL'); return 'SL_EXIT'
             if close <= state.target_price:
-                log.info(f"[TARGET] SELL [{candle['dt'].strftime('%H:%M')}]  close {close:.2f} <= T {state.target_price:.2f}")
-                self._exit(candle['dt'], close, 'TARGET')
-                return 'TARGET_EXIT'
+                log.info(f"[TARGET] SELL  close {close:.2f} <= T {state.target_price:.2f}")
+                self._exit(candle['dt'], close, 'TARGET'); return 'TARGET_EXIT'
 
         elif state.direction == 'BUY':
             if close <= state.sl_trigger:
-                log.warning(f"[SL] BUY [{candle['dt'].strftime('%H:%M')}]  close {close:.2f} <= SL {state.sl_trigger:.2f}")
-                self._exit(candle['dt'], close, 'SL')
-                return 'SL_EXIT'
+                log.warning(f"[SL] BUY  close {close:.2f} <= SL {state.sl_trigger:.2f}")
+                self._exit(candle['dt'], close, 'SL'); return 'SL_EXIT'
             if close >= state.target_price:
-                log.info(f"[TARGET] BUY [{candle['dt'].strftime('%H:%M')}]  close {close:.2f} >= T {state.target_price:.2f}")
-                self._exit(candle['dt'], close, 'TARGET')
-                return 'TARGET_EXIT'
+                log.info(f"[TARGET] BUY  close {close:.2f} >= T {state.target_price:.2f}")
+                self._exit(candle['dt'], close, 'TARGET'); return 'TARGET_EXIT'
 
         return 'HOLDING'
 
     def check_tick_exit(self, price: float):
         s = self.state
         if s.status != TradeState.OPEN: return
+        now = datetime.datetime.now(IST).replace(tzinfo=None)
 
         if s.day_bias == 'BEARISH' and s.orb_high and price > s.orb_high:
             log.warning(f"[INVALIDATION-TICK] ORB HIGH {price:.2f} > {s.orb_high:.2f}")
-            self._exit(datetime.datetime.now(IST).replace(tzinfo=None), price, 'ORB_HIGH_BREAK_ALGO_DEAD')
-            s.algo_dead = True
-            return
+            self._exit(now, price, 'ORB_HIGH_BREAK_ALGO_DEAD')
+            s.algo_dead = True; return
 
         if s.day_bias == 'BULLISH' and s.orb_low and price < s.orb_low:
             log.warning(f"[INVALIDATION-TICK] ORB LOW {price:.2f} < {s.orb_low:.2f}")
-            self._exit(datetime.datetime.now(IST).replace(tzinfo=None), price, 'ORB_LOW_BREAK_ALGO_DEAD')
-            s.algo_dead = True
-            return
+            self._exit(now, price, 'ORB_LOW_BREAK_ALGO_DEAD')
+            s.algo_dead = True; return
 
         if s.direction == 'SELL' and price <= s.target_price:
-            self._exit(datetime.datetime.now(IST).replace(tzinfo=None), price, 'TARGET_TICK')
+            self._exit(now, price, 'TARGET_TICK')
         elif s.direction == 'BUY' and price >= s.target_price:
-            self._exit(datetime.datetime.now(IST).replace(tzinfo=None), price, 'TARGET_TICK')
+            self._exit(now, price, 'TARGET_TICK')
 
     def square_off(self, price: float):
         if self.state.status == TradeState.OPEN:
@@ -1022,25 +1091,21 @@ class StrategyCore:
             self._exit(datetime.datetime.now(IST).replace(tzinfo=None), price, 'SQUARE_OFF')
         self.state.disarm('square-off time')
 
-    # ──────────────────────────────────────────────────────────────────────────
-    #  ORDER PLACEMENT
-    # ──────────────────────────────────────────────────────────────────────────
+    # ── ORDER PLACEMENT ───────────────────────────────────────────────────────
+
     def _place_order(self, candle, direction: str, entry: float,
-                     sl_trigger: float, target: float,
-                     candle_idx: int, is_add: bool,
-                     pivot_price_used: float, setup_size: float):
+                     sl_trigger: float, target: float, candle_idx: int,
+                     is_add: bool, pivot_price_used: float, setup_size: float):
         state = self.state
         qty   = (ADD_LOTS * LOT_SIZE) if is_add else (LOTS * LOT_SIZE)
 
         if not self.paper and self.kite:
             try:
-                kite_tx = (self.kite.TRANSACTION_TYPE_SELL
-                           if direction == 'SELL'
+                kite_tx = (self.kite.TRANSACTION_TYPE_SELL if direction == 'SELL'
                            else self.kite.TRANSACTION_TYPE_BUY)
                 oid = self.kite.place_order(
                     variety=self.kite.VARIETY_REGULAR, exchange=EXCHANGE_FUT,
-                    tradingsymbol=self.symbol,
-                    transaction_type=kite_tx,
+                    tradingsymbol=self.symbol, transaction_type=kite_tx,
                     quantity=qty, product=PRODUCT,
                     order_type=self.kite.ORDER_TYPE_MARKET
                 )
@@ -1075,7 +1140,6 @@ class StrategyCore:
                     (state.avg_entry_price * state.total_qty + entry * qty) / new_total
                 )
                 state.total_qty = new_total
-
             if direction == 'SELL':
                 state.sl_trigger       = max(state.sl_trigger, sl_trigger)
                 state.last_added_price = max(state.last_added_price, pivot_price_used)
@@ -1088,9 +1152,8 @@ class StrategyCore:
                  f"avg:{state.avg_entry_price:.2f}  "
                  f"SL:{state.sl_trigger:.2f}  T:{state.target_price:.2f}")
 
-    # ──────────────────────────────────────────────────────────────────────────
-    #  EXIT
-    # ──────────────────────────────────────────────────────────────────────────
+    # ── EXIT ──────────────────────────────────────────────────────────────────
+
     def _exit(self, dt, price: float, reason: str):
         state = self.state
         qty   = state.total_qty
@@ -1099,13 +1162,11 @@ class StrategyCore:
 
         if not self.paper and self.kite:
             try:
-                kite_tx = (self.kite.TRANSACTION_TYPE_BUY
-                           if state.direction == 'SELL'
+                kite_tx = (self.kite.TRANSACTION_TYPE_BUY if state.direction == 'SELL'
                            else self.kite.TRANSACTION_TYPE_SELL)
                 xid = self.kite.place_order(
                     variety=self.kite.VARIETY_REGULAR, exchange=EXCHANGE_FUT,
-                    tradingsymbol=self.symbol,
-                    transaction_type=kite_tx,
+                    tradingsymbol=self.symbol, transaction_type=kite_tx,
                     quantity=qty, product=PRODUCT,
                     order_type=self.kite.ORDER_TYPE_MARKET
                 )
@@ -1113,10 +1174,8 @@ class StrategyCore:
             except Exception as e:
                 log.error(f"[ERR] Exit order failed: {e}  — EXIT MANUALLY")
 
-        if state.direction == 'SELL':
-            pnl = (state.avg_entry_price - price) * qty
-        else:
-            pnl = (price - state.avg_entry_price) * qty
+        pnl = ((state.avg_entry_price - price) if state.direction == 'SELL'
+               else (price - state.avg_entry_price)) * qty
         state.pnl_today += pnl
 
         dt = dt.replace(tzinfo=None) if getattr(dt, 'tzinfo', None) else dt
@@ -1137,7 +1196,8 @@ class StrategyCore:
         }
         state.trade_log.append(trade_record)
 
-        mode_str = 'PAPER' if self.paper else 'LIVE'
+        mode_str = ('REPLAY' if (self.db and self.db.is_backtest)
+                    else ('PAPER' if self.paper else 'LIVE'))
         if self.db:
             self.db.log_trade(
                 trade_num    = len(state.trade_log),
@@ -1154,7 +1214,7 @@ class StrategyCore:
         log.info("=" * 62)
         log.info(f"[EXIT] {state.direction}  reason={reason}  bias={state.day_bias}")
         log.info(f"   AvgEntry {state.avg_entry_price:.2f} -> Exit {price:.2f}")
-        log.info(f"   Qty {qty}   Trade PnL Rs.{pnl:+,.0f}   Day PnL Rs.{state.pnl_today:+,.0f}")
+        log.info(f"   Qty {qty}  Trade PnL Rs.{pnl:+,.0f}  Day PnL Rs.{state.pnl_today:+,.0f}")
         log.info("=" * 62)
 
         state.reset_trade()
@@ -1164,7 +1224,8 @@ class StrategyCore:
 #  KITE DATA FETCH
 # =============================================================================
 
-def fetch_candles(kite, instrument_token, from_date=None, to_date=None, live=False):
+def fetch_candles(kite, instrument_token, from_date: str = None,
+                  to_date: str = None, live: bool = False) -> list:
     now = datetime.datetime.now(IST)
     if live:
         from_dt = now.replace(hour=9, minute=15, second=0, microsecond=0, tzinfo=IST)
@@ -1178,7 +1239,7 @@ def fetch_candles(kite, instrument_token, from_date=None, to_date=None, live=Fal
             to_dt = now.replace(tzinfo=IST)
 
     log.info(f"Fetching {INTERVAL}  "
-             f"{from_dt.strftime('%d %b %Y %H:%M')} -> {to_dt.strftime('%H:%M')}")
+             f"{from_dt.strftime('%d %b %Y %H:%M')} -> {to_dt.strftime('%d %b %Y %H:%M')}")
 
     records = kite.historical_data(
         instrument_token=instrument_token,
@@ -1196,8 +1257,8 @@ def fetch_candles(kite, instrument_token, from_date=None, to_date=None, live=Fal
                         'volume': r.get('volume', 0)})
 
     days = sorted(set(c['dt'].date() for c in out))
-    log.info(f"Fetched {len(out)} candles  ({days[0]} -> {days[-1]})" if days
-             else "No candles returned")
+    log.info(f"Fetched {len(out)} candles across {len(days)} day(s)  "
+             f"({days[0]} -> {days[-1]})" if days else "No candles returned")
     return out
 
 
@@ -1213,7 +1274,8 @@ class LiveBot:
         self.state   = TradeState()
         self._lock   = threading.Lock()
 
-        self.instrument_token, self.tradingsymbol, self.expiry = get_current_month_nifty_future(kite)
+        self.instrument_token, self.tradingsymbol, self.expiry = \
+            get_current_month_nifty_future(kite)
         self.session_date = datetime.datetime.now(IST).strftime('%Y-%m-%d')
 
         self.strategy = StrategyCore(
@@ -1226,47 +1288,34 @@ class LiveBot:
             session_date = self.session_date,
         )
 
-        log.info("=" * 62)
-        log.info(f"[MODE] NIFTY FUT: {self.tradingsymbol}  Expiry: {self.expiry}")
-        log.info("=" * 62)
+        log.info(f"[LIVE] {self.tradingsymbol}  Expiry:{self.expiry}  Paper:{PAPER_TRADE}")
 
-        # ── PRELOAD ───────────────────────────────────────────────────────────
-        log.info("[PRELOAD] Fetching today's FUT candles and replaying strategy...")
+        # ── Preload: replay today's candles before going live ─────────────────
+        log.info("[PRELOAD] Fetching today's candles for strategy warm-up...")
         try:
             candles = fetch_candles(kite, self.instrument_token, live=True)
             if not candles:
-                log.warning("[PRELOAD] No candles returned — starting fresh")
+                log.warning("[PRELOAD] No candles yet — starting fresh")
             else:
                 sq_time = datetime.time(*SQUARE_OFF_TIME)
                 for c in candles[:-1]:
                     self.builder.completed.append(c)
-
                 completed = self.builder.get_all()
-                log.info(f"[PRELOAD] Loaded {len(completed)} completed candles "
+                log.info(f"[PRELOAD] Replaying {len(completed)} candles  "
                          f"({completed[0]['dt'].strftime('%H:%M')} → "
                          f"{completed[-1]['dt'].strftime('%H:%M')})")
-
                 for i in range(len(completed)):
-                    if completed[i]['dt'].time() >= sq_time:
-                        log.info("[PRELOAD] Square-off time reached during replay — stopping")
-                        break
-                    if i < PIVOT_LEFT + PIVOT_RIGHT + 1:
-                        continue
+                    if completed[i]['dt'].time() >= sq_time: break
+                    if i < PIVOT_LEFT + PIVOT_RIGHT + 1: continue
                     self.strategy.on_candle_close(completed, i)
-
-                log.info("=" * 62)
-                log.info("[PRELOAD] State after replay:")
-                log.info(f"   ORB: H={self.state.orb_high}  L={self.state.orb_low}")
-                log.info(f"   Bias={self.state.day_bias}  AlgoDead={self.state.algo_dead}")
-                log.info(f"   Position={self.state.status}  Trades={self.state.trades_today}")
-                log.info(f"   PnL=Rs.{self.state.pnl_today:+,.0f}")
-                log.info("=" * 62)
-
+                log.info(f"[PRELOAD] Done — bias:{self.state.day_bias}  "
+                         f"pos:{self.state.status}  trades:{self.state.trades_today}  "
+                         f"PnL:Rs.{self.state.pnl_today:+,.0f}")
         except Exception as e:
             import traceback
             log.warning(f"[PRELOAD] Failed: {e}\n{traceback.format_exc()}")
 
-        # ── WEBSOCKET ─────────────────────────────────────────────────────────
+        # ── WebSocket ─────────────────────────────────────────────────────────
         self.ticker = KiteTicker(API_KEY, ACCESS_TOKEN)
         self.ticker.on_connect = self._on_connect
         self.ticker.on_ticks   = self._on_ticks
@@ -1280,8 +1329,7 @@ class LiveBot:
 
     def _on_ticks(self, ws, ticks):
         for t in ticks:
-            if t['instrument_token'] != self.instrument_token:
-                continue
+            if t['instrument_token'] != self.instrument_token: continue
             with self._lock:
                 self._process(t['last_price'], datetime.datetime.now(IST))
 
@@ -1292,17 +1340,15 @@ class LiveBot:
             return
         if ts.time() < datetime.time(9, 15):
             return
-
         closed = self.builder.on_tick(price, ts)
         if closed:
             candles = self.builder.get_all()
             self.strategy.on_candle_close(candles, len(candles) - 1)
-
         if self.state.status == TradeState.OPEN:
             self.strategy.check_tick_exit(price)
 
     def run(self):
-        log.info("Starting live feed...")
+        log.info("Starting live WebSocket feed...")
         self.ticker.connect(threaded=True)
         try:
             while True:
@@ -1315,10 +1361,9 @@ class LiveBot:
                     break
         except KeyboardInterrupt:
             if self.state.status == TradeState.OPEN:
-                log.warning("Open trade — EXIT MANUALLY ON KITE")
+                log.warning("Open trade on exit — EXIT MANUALLY ON KITE")
         finally:
             self.ticker.close()
-            # Save final session summary
             self.db.upsert_session_summary(
                 session_date  = self.session_date,
                 symbol        = self.tradingsymbol,
@@ -1332,15 +1377,21 @@ class LiveBot:
 
 
 # =============================================================================
-#  REPLAY
+#  BACKTEST REPLAY  (multi-day: fresh TradeState per calendar date)
 # =============================================================================
 
 def run_replay(kite, db: DB):
+    """
+    Fetches FROM_DATE -> TO_DATE candles.
+    Processes each calendar date with a fresh TradeState so multi-day backtests
+    work correctly and every day has its own rows in the backtest_* tables.
+    """
     token, tsym, exp = get_current_month_nifty_future(kite)
-    session_date = FROM_DATE
 
     log.info("=" * 62)
-    log.info(f"  REPLAY  {FROM_DATE} -> {TO_DATE}  [{INTERVAL}]   {tsym} (Exp:{exp})")
+    log.info(f"  BACKTEST  {FROM_DATE} -> {TO_DATE}  [{INTERVAL}]  {tsym}  (Exp:{exp})")
+    log.info(f"  Writes -> backtest_trades, backtest_swing_pivots,")
+    log.info(f"            backtest_orb_snapshots, backtest_session_summaries")
     log.info("=" * 62)
 
     try:
@@ -1350,81 +1401,101 @@ def run_replay(kite, db: DB):
     if not all_candles:
         log.error("No candles returned"); return
 
-    state    = TradeState()
-    strategy = StrategyCore(
-        state        = state,
-        paper        = True,
-        kite         = kite,
-        symbol       = tsym,
-        expiry       = exp,
-        db           = db,
-        session_date = session_date,
-    )
-    sq_time = datetime.time(*SQUARE_OFF_TIME)
+    # Group by date
+    by_day: dict = _dd(list)
+    for c in all_candles:
+        by_day[c['dt'].date()].append(c)
 
-    for i, candle in enumerate(all_candles):
-        if candle['dt'].time() >= sq_time:
-            if state.status == TradeState.OPEN:
-                strategy.square_off(candle['close'])
-            break
-        if i < PIVOT_LEFT + PIVOT_RIGHT + 1:
-            continue
-        strategy.on_candle_close(all_candles[:i + 1], i)
-        if REPLAY_DELAY_S > 0:
-            time.sleep(REPLAY_DELAY_S)
+    sq_time        = datetime.time(*SQUARE_OFF_TIME)
+    overall_pnl    = 0.0
+    overall_trades = 0
 
-    log.info("=" * 62)
-    log.info("  REPLAY COMPLETE")
-    log.info(f"  Day Bias : {state.day_bias}   Algo Dead : {state.algo_dead}")
-    log.info(f"  Trades   : {len(state.trade_log)}   PnL : Rs.{state.pnl_today:+,.0f}")
-    log.info("=" * 62)
-    for i, t in enumerate(state.trade_log, 1):
-        et = t['exit_dt'].strftime('%H:%M') if hasattr(t['exit_dt'], 'strftime') else ''
-        log.info(
-            f"  [{i}] {t['direction']}({t.get('bias','?')})  "
-            f"in:{t['entry_dt'].strftime('%H:%M')}@{t['entry_price']:.2f}  "
-            f"out:{et}@{t['exit_price']:.2f}  "
-            f"{t['reason']}  Rs.{t['pnl']:+,.0f}  qty:{t.get('qty',0)}"
+    for day_date in sorted(by_day.keys()):
+        day_candles  = by_day[day_date]
+        session_date = day_date.strftime('%Y-%m-%d')
+
+        log.info("=" * 62)
+        log.info(f"  DAY: {session_date}  ({len(day_candles)} candles)")
+        log.info("=" * 62)
+
+        state    = TradeState()
+        strategy = StrategyCore(
+            state        = state,
+            paper        = True,
+            kite         = kite,
+            symbol       = tsym,
+            expiry       = exp,
+            db           = db,
+            session_date = session_date,
         )
-    log.info("=" * 62)
 
-    db.upsert_session_summary(
-        session_date  = session_date,
-        symbol        = tsym,
-        mode          = 'REPLAY',
-        day_bias      = state.day_bias,
-        total_trades  = state.trades_today,
-        total_pnl     = state.pnl_today,
-        algo_dead     = state.algo_dead,
-        trade_log     = state.trade_log,
-    )
+        for i, candle in enumerate(day_candles):
+            if candle['dt'].time() >= sq_time:
+                if state.status == TradeState.OPEN:
+                    strategy.square_off(candle['close'])
+                break
+            if i < PIVOT_LEFT + PIVOT_RIGHT + 1:
+                continue
+            strategy.on_candle_close(day_candles[:i + 1], i)
+            if REPLAY_DELAY_S > 0:
+                time.sleep(REPLAY_DELAY_S)
+
+        overall_pnl    += state.pnl_today
+        overall_trades += state.trades_today
+
+        log.info(f"  Day result — bias:{state.day_bias}  algo_dead:{state.algo_dead}  "
+                 f"trades:{len(state.trade_log)}  PnL:Rs.{state.pnl_today:+,.0f}")
+        for i, t in enumerate(state.trade_log, 1):
+            et = t['exit_dt'].strftime('%H:%M') if hasattr(t['exit_dt'], 'strftime') else ''
+            log.info(
+                f"    [{i}] {t['direction']}({t.get('bias','?')})  "
+                f"in:{t['entry_dt'].strftime('%H:%M')}@{t['entry_price']:.2f}  "
+                f"out:{et}@{t['exit_price']:.2f}  "
+                f"{t['reason']}  Rs.{t['pnl']:+,.0f}  qty:{t.get('qty',0)}"
+            )
+
+        db.upsert_session_summary(
+            session_date  = session_date,
+            symbol        = tsym,
+            mode          = 'REPLAY',
+            day_bias      = state.day_bias,
+            total_trades  = state.trades_today,
+            total_pnl     = state.pnl_today,
+            algo_dead     = state.algo_dead,
+            trade_log     = state.trade_log,
+        )
+
+    log.info("=" * 62)
+    log.info(f"  BACKTEST COMPLETE  {FROM_DATE} -> {TO_DATE}")
+    log.info(f"  Total trades : {overall_trades}")
+    log.info(f"  Total PnL    : Rs.{overall_pnl:+,.0f}")
+    log.info("=" * 62)
 
 
 # =============================================================================
 #  CONFIG PRINT
 # =============================================================================
 
-def print_config(symbol="NIFTYFUT"):
+def print_config(symbol: str = "NIFTYFUT", mode: str = "LIVE"):
     log.info("=" * 62)
     log.info("  NIFTY FUT  ORB Breakout — Bullish + Bearish Swing Bot")
-    log.info("  Railway.app deployment  |  PostgreSQL persistence")
+    log.info(f"  Mode        : {mode}")
+    log.info(f"  DB tables   : {'backtest_trades, backtest_swing_pivots, ...' if mode == 'BACKTEST' else 'trades, swing_pivots, ...'}")
     log.info("=" * 62)
-    log.info(f"  Symbol          : {symbol} ({EXCHANGE_FUT})")
-    log.info(f"  Interval        : {INTERVAL}")
-    log.info(f"  ORB window      : 9:15 - 9:{15+ORB_MINUTES:02d}  ({ORB_MINUTES} bars)")
-    log.info(f"  Pivot L/R       : {PIVOT_LEFT} / {PIVOT_RIGHT}")
-    log.info(f"  Min pivot gap   : {MIN_PIVOT_DIST} pts")
-    log.info(f"  ORB break buf   : {BREAK_BUFFER} pts")
-    log.info(f"  Retest buffer   : {RETEST_BUFFER} pts")
-    log.info(f"  Min setup size  : {MIN_SETUP_POINTS} pts")
-    log.info(f"  SL buffer       : {SL_BUFFER} pts beyond entry pivot")
-    log.info(f"  VWAP SL         : {VWAP_CONSEC_CLOSES} closes beyond VWAP ± {VWAP_SL_POINTS} pts")
-    log.info(f"  Max SL dist     : {MAX_SL_POINTS} pts")
-    log.info(f"  Lots/Add/Max    : {LOTS} / {ADD_LOTS} / {MAX_TOTAL_LOTS}")
-    log.info(f"  Max trades/day  : {MAX_TRADES_DAY}")
-    log.info(f"  Square-off      : {SQUARE_OFF_TIME[0]:02d}:{SQUARE_OFF_TIME[1]:02d} IST")
-    log.info(f"  Paper trade     : {PAPER_TRADE}")
-    log.info(f"  Database        : {DATABASE_URL[:40]}...")
+    log.info(f"  Symbol      : {symbol} ({EXCHANGE_FUT})")
+    log.info(f"  Interval    : {INTERVAL}")
+    log.info(f"  ORB window  : 9:15 - 9:{15+ORB_MINUTES:02d}  ({ORB_MINUTES} bars)")
+    log.info(f"  Pivot L/R   : {PIVOT_LEFT} / {PIVOT_RIGHT}")
+    log.info(f"  ORB buf     : {BREAK_BUFFER} pts  |  Retest: {RETEST_BUFFER} pts")
+    log.info(f"  Min setup   : {MIN_SETUP_POINTS} pts  |  SL buf: {SL_BUFFER} pts")
+    log.info(f"  VWAP SL     : {VWAP_CONSEC_CLOSES} closes beyond VWAP ± {VWAP_SL_POINTS} pts")
+    log.info(f"  Lots        : {LOTS} / add {ADD_LOTS} / max {MAX_TOTAL_LOTS}")
+    log.info(f"  Max SL      : {MAX_SL_POINTS} pts  |  Max trades/day: {MAX_TRADES_DAY}")
+    log.info(f"  Square-off  : {SQUARE_OFF_TIME[0]:02d}:{SQUARE_OFF_TIME[1]:02d} IST")
+    log.info(f"  Paper trade : {PAPER_TRADE}")
+    if mode == 'BACKTEST':
+        log.info(f"  Date range  : {FROM_DATE} -> {TO_DATE}")
+    log.info(f"  Database    : {DATABASE_URL[:55]}...")
     log.info("=" * 62)
 
 
@@ -1433,36 +1504,37 @@ def print_config(symbol="NIFTYFUT"):
 # =============================================================================
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='NIFTY FUT ORB Breakout Bot (Bull + Bear)')
-    parser.add_argument('--replay', action='store_true', help='Force replay mode')
+    parser = argparse.ArgumentParser(description='NIFTY FUT ORB Breakout Bot')
+    parser.add_argument('--replay', action='store_true',
+                        help='Force backtest mode (same as FORCE_REPLAY=true)')
     args = parser.parse_args()
 
-    if (not API_KEY or not ACCESS_TOKEN
-            or "PUT_YOUR" in API_KEY or "PUT_YOUR" in ACCESS_TOKEN):
-        print("\nSet KITE_API_KEY and KITE_ACCESS_TOKEN environment variables.\n")
+    if "YOUR_" in API_KEY or "YOUR_" in ACCESS_TOKEN:
+        print("\nSet KITE_API_KEY and KITE_ACCESS_TOKEN as environment variables.\n")
         sys.exit(1)
 
-    db   = DB(DATABASE_URL)
     kite = KiteConnect(api_key=API_KEY)
     kite.set_access_token(ACCESS_TOKEN)
 
     try:
         token, tsym, exp = get_current_month_nifty_future(kite)
     except Exception as e:
-        log.error(f"Failed to resolve NIFTY FUT: {e}")
-        sys.exit(1)
+        log.error(f"Failed to resolve NIFTY FUT: {e}"); sys.exit(1)
 
-    print_config(tsym)
+    now         = datetime.datetime.now(IST).time()
+    is_live     = datetime.time(9, 15) <= now <= datetime.time(15, 30)
+    do_backtest = args.replay or FORCE_REPLAY or not is_live
 
-    now     = datetime.datetime.now(IST).time()
-    is_live = datetime.time(9, 15) <= now <= datetime.time(15, 30)
-
-    if args.replay:
-        log.info("Mode: REPLAY (forced)")
+    if do_backtest:
+        reason = ("--replay flag" if args.replay
+                  else "FORCE_REPLAY=true" if FORCE_REPLAY
+                  else "market closed")
+        log.info(f"Mode: BACKTEST ({reason})")
+        print_config(tsym, mode='BACKTEST')
+        db = DB(DATABASE_URL, is_backtest=True)   # writes to backtest_* tables
         run_replay(kite, db)
-    elif is_live:
-        log.info("Mode: LIVE")
-        LiveBot(kite, db).run()
     else:
-        log.info(f"Mode: REPLAY (market closed  {now.strftime('%H:%M')} IST)")
-        run_replay(kite, db)
+        log.info("Mode: LIVE")
+        print_config(tsym, mode='LIVE')
+        db = DB(DATABASE_URL, is_backtest=False)  # writes to live tables
+        LiveBot(kite, db).run()
