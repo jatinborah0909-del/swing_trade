@@ -17,6 +17,12 @@ ENV VARS (Railway):
 - DATABASE_URL
 Optional:
 - PAPER_TRADE=1  (default 1; set 0 for LIVE placing to Kite)
+
+FIXES vs original:
+  FIX-1  fetch_candles: guard against pre-market start (from_dt > to_dt crash)
+  FIX-2  main(): pre-market wait loop — bot sleeps until 09:13 IST before init
+  FIX-3  run(): safe exit time pushed to 15:20 so IDLE bot doesn't quit mid-session
+         on an intra-day Railway restart
 """
 
 import os, sys, time, datetime, threading, logging, json
@@ -31,7 +37,7 @@ import psycopg2
 import psycopg2.extras
 
 # =============================================================================
-#  CONFIG (keep aligned with your original bot)
+#  CONFIG
 # =============================================================================
 
 API_KEY      = os.getenv("API_KEY", "").strip()
@@ -108,7 +114,6 @@ def db_init():
             WHERE NOT EXISTS (SELECT 1 FROM trade_flag);
             """)
 
-            # Trades summary (one row per "main trade"; scaling events in events table)
             cur.execute("""
             CREATE TABLE IF NOT EXISTS nifty_orb_swing_trades (
                 id SERIAL PRIMARY KEY,
@@ -165,7 +170,6 @@ def db_init():
             ON nifty_orb_swing_trades (trade_date, status);
             """)
 
-            # Detailed events: ENTRY / ADD / EXIT / INFO
             cur.execute("""
             CREATE TABLE IF NOT EXISTS nifty_orb_swing_events (
                 id SERIAL PRIMARY KEY,
@@ -174,7 +178,7 @@ def db_init():
                 symbol TEXT NOT NULL,
                 ts TIMESTAMP NOT NULL,
 
-                event_type TEXT NOT NULL,  -- ENTRY/ADD/EXIT/INFO
+                event_type TEXT NOT NULL,
                 note TEXT,
 
                 candle_dt TIMESTAMP,
@@ -622,7 +626,7 @@ def compute_orb(candles: list):
     }
 
 # =============================================================================
-#  STRATEGY CORE (Your full logic, DB-instrumented)
+#  STRATEGY CORE
 # =============================================================================
 
 class StrategyCore:
@@ -905,7 +909,7 @@ class StrategyCore:
         return "BUY_ENTRY"
 
     # -------------------------------------------------------------------------
-    #  SCALING — add on next swing pivot
+    #  SCALING
     # -------------------------------------------------------------------------
     def _maybe_add(self, candle, candle_idx, close, pivots, vwap):
         s = self.state
@@ -929,20 +933,12 @@ class StrategyCore:
             new_sl = sh["price"] + SL_BUFFER
             log.info(f"[ADD-SELL] SH {sh['price']:.2f} reached -> add {ADD_LOTS} lot(s) at {close:.2f} new SL:{new_sl:.2f}")
             self._place_order(
-                candle=candle,
-                direction="SELL",
-                entry=close,
-                sl_trigger=new_sl,
-                target=s.target_price,
-                candle_idx=candle_idx,
-                is_add=True,
-                pivot_price_used=sh["price"],
-                pivot_idx=sh["idx"],
-                pivot_dt=sh["dt"],
-                pivot_type="high",
-                setup_size=0.0,
-                close=close,
-                vwap=vwap
+                candle=candle, direction="SELL", entry=close,
+                sl_trigger=new_sl, target=s.target_price,
+                candle_idx=candle_idx, is_add=True,
+                pivot_price_used=sh["price"], pivot_idx=sh["idx"],
+                pivot_dt=sh["dt"], pivot_type="high",
+                setup_size=0.0, close=close, vwap=vwap
             )
 
         elif s.direction == "BUY":
@@ -958,24 +954,16 @@ class StrategyCore:
             new_sl = sl["price"] - SL_BUFFER
             log.info(f"[ADD-BUY] SL {sl['price']:.2f} reached -> add {ADD_LOTS} lot(s) at {close:.2f} new SL:{new_sl:.2f}")
             self._place_order(
-                candle=candle,
-                direction="BUY",
-                entry=close,
-                sl_trigger=new_sl,
-                target=s.target_price,
-                candle_idx=candle_idx,
-                is_add=True,
-                pivot_price_used=sl["price"],
-                pivot_idx=sl["idx"],
-                pivot_dt=sl["dt"],
-                pivot_type="low",
-                setup_size=0.0,
-                close=close,
-                vwap=vwap
+                candle=candle, direction="BUY", entry=close,
+                sl_trigger=new_sl, target=s.target_price,
+                candle_idx=candle_idx, is_add=True,
+                pivot_price_used=sl["price"], pivot_idx=sl["idx"],
+                pivot_dt=sl["dt"], pivot_type="low",
+                setup_size=0.0, close=close, vwap=vwap
             )
 
     # -------------------------------------------------------------------------
-    #  EXIT CHECK (pivot SL/target)
+    #  EXIT CHECK
     # -------------------------------------------------------------------------
     def _check_exit(self, candle, candle_idx: int, close: float, vwap: float) -> str:
         s = self.state
@@ -1003,7 +991,6 @@ class StrategyCore:
         return "HOLDING"
 
     def check_tick_exit(self, price: float):
-        """Tick-level invalidation / target for live mode."""
         s = self.state
         if s.status != TradeState.OPEN:
             return
@@ -1034,20 +1021,18 @@ class StrategyCore:
         self.state.disarm("square-off time")
 
     # -------------------------------------------------------------------------
-    #  ORDER PLACEMENT (DB integrated)
+    #  ORDER PLACEMENT
     # -------------------------------------------------------------------------
     def _place_order(self, candle, direction: str, entry: float,
                      sl_trigger: float, target: float,
                      candle_idx: int, is_add: bool,
                      pivot_price_used: float, pivot_idx: int, pivot_dt: datetime.datetime,
-                     pivot_type: str,
-                     setup_size: float,
+                     pivot_type: str, setup_size: float,
                      close: float, vwap: float):
 
         s = self.state
         qty = (ADD_LOTS * LOT_SIZE) if is_add else (LOTS * LOT_SIZE)
 
-        # Live order placement (optional)
         if not self.paper and self.kite:
             try:
                 kite_tx = (self.kite.TRANSACTION_TYPE_SELL if direction == "SELL" else self.kite.TRANSACTION_TYPE_BUY)
@@ -1067,7 +1052,6 @@ class StrategyCore:
         else:
             log.info(f"[PAPER] {'ADD' if is_add else 'ENTRY'} {direction} qty:{qty}")
 
-        # Update state
         if s.status != TradeState.OPEN:
             s.status          = TradeState.OPEN
             s.direction       = direction
@@ -1084,67 +1068,46 @@ class StrategyCore:
             s.vwap_breach_count = 0
             s.last_vwap_side = None
 
-            # New trade_no for today
             if s.trade_no <= 0:
                 max_no, pnl_closed = db_today_stats(s.trade_date)
                 s.trade_no = max_no + 1
-                # keep pnl_today as closed pnl (so DB day pnl matches)
                 s.pnl_today = pnl_closed
 
             payload = {
-                "trade_date": s.trade_date,
-                "trade_no": s.trade_no,
-                "symbol": s.symbol,
-                "mode": s.mode,
-
-                "bias": s.day_bias,
-                "direction": s.direction,
-
-                "entry_time": s.entry_time,
-                "entry_price": s.avg_entry_price,
-                "entry_close": close,
-                "entry_vwap": vwap,
-
+                "trade_date": s.trade_date, "trade_no": s.trade_no,
+                "symbol": s.symbol, "mode": s.mode,
+                "bias": s.day_bias, "direction": s.direction,
+                "entry_time": s.entry_time, "entry_price": s.avg_entry_price,
+                "entry_close": close, "entry_vwap": vwap,
                 "entry_qty": s.total_qty,
                 "entry_lots": s.total_qty // LOT_SIZE if LOT_SIZE else 0,
-
-                "orb_high": s.orb_high,
-                "orb_low": s.orb_low,
-
-                "origin_type": s.origin_type,
-                "origin_price": s.origin_price,
-                "origin_idx": s.origin_idx,
-                "origin_dt": s.origin_dt,
-
+                "orb_high": s.orb_high, "orb_low": s.orb_low,
+                "origin_type": s.origin_type, "origin_price": s.origin_price,
+                "origin_idx": s.origin_idx, "origin_dt": s.origin_dt,
                 "trigger_pivot_type": pivot_type,
                 "trigger_pivot_price": pivot_price_used,
-                "trigger_pivot_idx": pivot_idx,
-                "trigger_pivot_dt": pivot_dt,
-
-                "setup_size": setup_size,
-                "sl_price": s.sl_trigger,
+                "trigger_pivot_idx": pivot_idx, "trigger_pivot_dt": pivot_dt,
+                "setup_size": setup_size, "sl_price": s.sl_trigger,
                 "target_price": s.target_price,
                 "risk_per_lot": abs(s.sl_trigger - close) * LOT_SIZE,
             }
 
             db_trade_open_insert(s.symbol, s.mode, s.trade_no, s.trade_date, payload)
-
             db_event(
-                s.trade_date, s.trade_no, s.symbol, "ENTRY",
-                note="ENTRY_TAKEN",
+                s.trade_date, s.trade_no, s.symbol, "ENTRY", note="ENTRY_TAKEN",
                 candle_dt=candle["dt"], candle_idx=candle_idx, close=close, vwap=vwap,
                 direction=s.direction, qty=s.total_qty, avg_entry=s.avg_entry_price,
                 sl=s.sl_trigger, target=s.target_price,
-                pivot_type=pivot_type, pivot_price=pivot_price_used, pivot_idx=pivot_idx, pivot_dt=pivot_dt,
-                origin_type=s.origin_type, origin_price=s.origin_price, origin_idx=s.origin_idx, origin_dt=s.origin_dt,
+                pivot_type=pivot_type, pivot_price=pivot_price_used,
+                pivot_idx=pivot_idx, pivot_dt=pivot_dt,
+                origin_type=s.origin_type, origin_price=s.origin_price,
+                origin_idx=s.origin_idx, origin_dt=s.origin_dt,
                 orb_high=s.orb_high, orb_low=s.orb_low,
                 extra={"setup_size": setup_size, "risk_per_lot": abs(s.sl_trigger - close) * LOT_SIZE}
             )
-
         else:
-            # ADD leg
             if s.avg_entry_price is None or s.total_qty == 0:
-                log.warning("[FIX] avg_entry_price was None during ADD — correcting to fresh entry state")
+                log.warning("[FIX] avg_entry_price was None during ADD — correcting")
                 s.avg_entry_price = entry
                 s.total_qty = qty
             else:
@@ -1160,15 +1123,15 @@ class StrategyCore:
                 s.last_added_price = min(s.last_added_price, pivot_price_used)
 
             s.used_prices_in_trade.add(pivot_price_used)
-
             db_event(
-                s.trade_date, s.trade_no, s.symbol, "ADD",
-                note="SCALE_IN",
+                s.trade_date, s.trade_no, s.symbol, "ADD", note="SCALE_IN",
                 candle_dt=candle["dt"], candle_idx=candle_idx, close=close, vwap=vwap,
                 direction=s.direction, qty=s.total_qty, avg_entry=s.avg_entry_price,
                 sl=s.sl_trigger, target=s.target_price,
-                pivot_type=pivot_type, pivot_price=pivot_price_used, pivot_idx=pivot_idx, pivot_dt=pivot_dt,
-                origin_type=s.origin_type, origin_price=s.origin_price, origin_idx=s.origin_idx, origin_dt=s.origin_dt,
+                pivot_type=pivot_type, pivot_price=pivot_price_used,
+                pivot_idx=pivot_idx, pivot_dt=pivot_dt,
+                origin_type=s.origin_type, origin_price=s.origin_price,
+                origin_idx=s.origin_idx, origin_dt=s.origin_dt,
                 orb_high=s.orb_high, orb_low=s.orb_low,
                 extra={"added_qty": qty, "new_total_qty": s.total_qty}
             )
@@ -1176,16 +1139,15 @@ class StrategyCore:
         log.info(f"[POS] {s.direction} qty:{s.total_qty} avg:{s.avg_entry_price:.2f} SL:{s.sl_trigger:.2f} T:{s.target_price:.2f}")
 
     # -------------------------------------------------------------------------
-    #  EXIT (DB integrated)
+    #  EXIT
     # -------------------------------------------------------------------------
-    def _exit(self, dt, price: float, reason: str, close: float, vwap: float, candle_idx: int | None):
+    def _exit(self, dt, price: float, reason: str, close: float, vwap: float, candle_idx):
         s = self.state
         qty = s.total_qty
         if qty <= 0:
             s.reset_trade()
             return
 
-        # Live exit order (optional)
         if not self.paper and self.kite:
             try:
                 kite_tx = (self.kite.TRANSACTION_TYPE_BUY if s.direction == "SELL" else self.kite.TRANSACTION_TYPE_SELL)
@@ -1203,35 +1165,28 @@ class StrategyCore:
                 log.error(f"[ERR] Exit order failed: {e} — EXIT MANUALLY")
 
         if s.direction == "SELL":
-            pnl = (s.avg_entry_price - price) * qty
+            pnl     = (s.avg_entry_price - price) * qty
             pnl_pts = (s.avg_entry_price - price)
         else:
-            pnl = (price - s.avg_entry_price) * qty
+            pnl     = (price - s.avg_entry_price) * qty
             pnl_pts = (price - s.avg_entry_price)
 
         s.pnl_today += pnl
-
         dt = dt.replace(tzinfo=None) if getattr(dt, "tzinfo", None) else dt
 
-        # Update trades table
         db_trade_close_update(s.trade_date, s.trade_no, {
-            "exit_time": dt,
-            "exit_price": price,
-            "exit_close": close,
-            "exit_vwap": vwap,
-            "exit_reason": reason,
-            "pnl_points": pnl_pts,
-            "pnl_rs": pnl,
-            "day_pnl_rs": s.pnl_today
+            "exit_time": dt, "exit_price": price,
+            "exit_close": close, "exit_vwap": vwap,
+            "exit_reason": reason, "pnl_points": pnl_pts,
+            "pnl_rs": pnl, "day_pnl_rs": s.pnl_today
         })
-
         db_event(
-            s.trade_date, s.trade_no, s.symbol, "EXIT",
-            note=reason,
+            s.trade_date, s.trade_no, s.symbol, "EXIT", note=reason,
             candle_dt=dt, candle_idx=candle_idx, close=close, vwap=vwap,
             direction=s.direction, qty=qty, avg_entry=s.avg_entry_price,
             sl=s.sl_trigger, target=s.target_price,
-            origin_type=s.origin_type, origin_price=s.origin_price, origin_idx=s.origin_idx, origin_dt=s.origin_dt,
+            origin_type=s.origin_type, origin_price=s.origin_price,
+            origin_idx=s.origin_idx, origin_dt=s.origin_dt,
             orb_high=s.orb_high, orb_low=s.orb_low,
             extra={"pnl_rs": pnl, "pnl_points": pnl_pts, "day_pnl_rs": s.pnl_today}
         )
@@ -1245,13 +1200,19 @@ class StrategyCore:
         s.reset_trade()
 
 # =============================================================================
-#  KITE DATA FETCH (for preload)
+#  KITE DATA FETCH  ← FIX-1: guard against pre-market start
 # =============================================================================
 
 def fetch_candles(kite, instrument_token, live=False):
-    now = datetime.datetime.now(IST)
+    now     = datetime.datetime.now(IST)
     from_dt = now.replace(hour=9, minute=15, second=0, microsecond=0, tzinfo=IST)
     to_dt   = now.replace(tzinfo=IST)
+
+    # ✅ FIX-1: If bot starts before market opens, from_dt > to_dt → Kite throws
+    #           "from date cannot be after to date" which silently kills preload.
+    if to_dt <= from_dt:
+        log.info(f"[PRELOAD] Pre-market ({now.strftime('%H:%M')} IST) — no candles to fetch yet.")
+        return []
 
     records = kite.historical_data(
         instrument_token=instrument_token,
@@ -1261,7 +1222,8 @@ def fetch_candles(kite, instrument_token, live=False):
 
     out = []
     for r in records:
-        dt = r["date"] if isinstance(r["date"], datetime.datetime) else datetime.datetime.fromisoformat(str(r["date"]))
+        dt = r["date"] if isinstance(r["date"], datetime.datetime) else \
+             datetime.datetime.fromisoformat(str(r["date"]))
         dt = dt.replace(tzinfo=None, second=0, microsecond=0)
         if datetime.time(9, 15) <= dt.time() <= datetime.time(15, 30):
             out.append({
@@ -1272,32 +1234,29 @@ def fetch_candles(kite, instrument_token, live=False):
     return out
 
 # =============================================================================
-#  LIVE BOT (Railway)
+#  LIVE BOT
 # =============================================================================
 
 class LiveBot:
     def __init__(self, kite):
-        self.kite = kite
+        self.kite    = kite
         self.builder = CandleBuilder()
-        self.state = TradeState()
-        self._lock = threading.Lock()
+        self.state   = TradeState()
+        self._lock   = threading.Lock()
 
-        self.instrument_token, self.tradingsymbol, self.expiry = get_current_month_nifty_future(kite)
+        self.instrument_token, self.tradingsymbol, self.expiry = \
+            get_current_month_nifty_future(kite)
         self.state.symbol = self.tradingsymbol
-        self.strategy = StrategyCore(self.state, paper=PAPER_TRADE, kite=kite, symbol=self.tradingsymbol)
+        self.strategy = StrategyCore(self.state, paper=PAPER_TRADE,
+                                     kite=kite, symbol=self.tradingsymbol)
 
-        # Kill-switch cache
-        self._ks_last_check = 0.0
+        self._ks_last_check    = 0.0
         self._ks_cached_allowed = True
-        self._ks_every_s = 5.0
+        self._ks_every_s       = 5.0
 
-        # Restore today's stats / open trade
         self._restore_from_db()
-
-        # Preload candles and replay logic (same behavior as your script)
         self._preload_and_replay()
 
-        # WebSocket
         self.ticker = KiteTicker(API_KEY, ACCESS_TOKEN)
         self.ticker.on_connect = self._on_connect
         self.ticker.on_ticks   = self._on_ticks
@@ -1309,29 +1268,27 @@ class LiveBot:
         self.state.trade_date = today
 
         max_no, pnl_closed = db_today_stats(today)
-        self.state.trade_no = max_no  # next entry will +1 in _place_order if needed
-        self.state.pnl_today = pnl_closed
-        self.state.trades_today = max_no  # trade_no approximates count; ok for cap
+        self.state.trade_no     = max_no
+        self.state.pnl_today    = pnl_closed
+        self.state.trades_today = max_no
 
         open_trade = db_load_open_trade(today)
         if open_trade:
-            # Restore OPEN trade into memory state
-            self.state.status = TradeState.OPEN
-            self.state.direction = open_trade["direction"]
+            self.state.status         = TradeState.OPEN
+            self.state.direction      = open_trade["direction"]
             self.state.avg_entry_price = float(open_trade["entry_price"])
-            self.state.total_qty = int(open_trade["entry_qty"] or 0)
-            self.state.sl_trigger = float(open_trade["sl_price"])
-            self.state.target_price = float(open_trade["target_price"])
-            self.state.entry_time = open_trade["entry_time"]
-            self.state.day_bias = open_trade.get("bias") or "NONE"
-            self.state.orb_high = open_trade.get("orb_high")
-            self.state.orb_low = open_trade.get("orb_low")
-            self.state.origin_type = open_trade.get("origin_type")
-            self.state.origin_price = open_trade.get("origin_price")
-            self.state.origin_idx = open_trade.get("origin_idx")
-            self.state.origin_dt = open_trade.get("origin_dt")
-            self.state.trade_no = int(open_trade["trade_no"])
-
+            self.state.total_qty      = int(open_trade["entry_qty"] or 0)
+            self.state.sl_trigger     = float(open_trade["sl_price"])
+            self.state.target_price   = float(open_trade["target_price"])
+            self.state.entry_time     = open_trade["entry_time"]
+            self.state.day_bias       = open_trade.get("bias") or "NONE"
+            self.state.orb_high       = open_trade.get("orb_high")
+            self.state.orb_low        = open_trade.get("orb_low")
+            self.state.origin_type    = open_trade.get("origin_type")
+            self.state.origin_price   = open_trade.get("origin_price")
+            self.state.origin_idx     = open_trade.get("origin_idx")
+            self.state.origin_dt      = open_trade.get("origin_dt")
+            self.state.trade_no       = int(open_trade["trade_no"])
             log.warning("=" * 62)
             log.warning("[RESTORE] Found OPEN trade in DB -> restored into memory")
             log.warning(f"  trade_no={self.state.trade_no} dir={self.state.direction} qty={self.state.total_qty}")
@@ -1345,12 +1302,10 @@ class LiveBot:
         try:
             candles = fetch_candles(self.kite, self.instrument_token, live=True)
             if not candles:
-                log.warning("[PRELOAD] No candles returned — starting fresh")
+                log.warning("[PRELOAD] No candles returned — starting fresh (normal if pre-market)")
                 return
 
             sq_time = datetime.time(*SQUARE_OFF_TIME)
-
-            # load all completed candles into builder (skip last forming)
             for c in candles[:-1]:
                 self.builder.completed.append(c)
 
@@ -1410,9 +1365,6 @@ class LiveBot:
                 self._process(t["last_price"], datetime.datetime.now(IST))
 
     def _process(self, price, ts):
-        ts_naive = ts.replace(tzinfo=None)
-
-        # Kill switch behavior: if OFF and position open -> square off immediately and stop for day.
         if not self._kill_switch_allowed():
             if self.state.status == TradeState.OPEN:
                 self.strategy.square_off(price, reason="KILL_SWITCH")
@@ -1444,7 +1396,12 @@ class LiveBot:
             while True:
                 time.sleep(30)
                 now = datetime.datetime.now(IST)
-                if (now.time() > datetime.time(*SQUARE_OFF_TIME) and self.state.status == TradeState.IDLE):
+                # ✅ FIX-3: Only quit AFTER 15:20 IST (5-min buffer past square-off).
+                #    Original used SQUARE_OFF_TIME (15:15) which could cause premature
+                #    exit on an intra-day Railway restart where status is still IDLE.
+                safe_done = datetime.time(SQUARE_OFF_TIME[0],
+                                          min(SQUARE_OFF_TIME[1] + 5, 59))
+                if now.time() > safe_done and self.state.status == TradeState.IDLE:
                     log.info(f"Session done — trades:{self.state.trades_today} PnL:Rs.{self.state.pnl_today:+,.0f}")
                     break
         finally:
@@ -1454,10 +1411,27 @@ class LiveBot:
                 pass
 
 # =============================================================================
-#  MAIN
+#  MAIN  ← FIX-2: pre-market wait loop
 # =============================================================================
 
 def main():
+    # ✅ FIX-2: If Railway starts the container before market hours (common when
+    #    deploying at night or after a crash restart), spin here instead of
+    #    crashing inside fetch_candles or creating zombie state.
+    #    We wake up at 09:13 IST — 2 minutes before market open — so the bot
+    #    is fully initialised and WebSocket connected by 09:15.
+    WAKE_TIME = datetime.time(9, 13)
+    while True:
+        now = datetime.datetime.now(IST)
+        if now.time() >= WAKE_TIME:
+            break
+        wait_secs = (
+            datetime.datetime.combine(now.date(), WAKE_TIME, tzinfo=IST) - now
+        ).seconds
+        log.info(f"[STARTUP] Pre-market — sleeping {wait_secs}s until 09:13 IST "
+                 f"(now {now.strftime('%H:%M:%S')} IST)")
+        time.sleep(min(wait_secs, 60))
+
     db_init()
 
     kite = KiteConnect(api_key=API_KEY)
