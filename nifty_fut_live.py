@@ -49,8 +49,8 @@ IST = ZoneInfo("Asia/Kolkata")
 #  CONFIG
 # =============================================================================
 
-API_KEY          = "9qfecm39l1j64xyc"
-ACCESS_TOKEN     = "LY24Uy4cYIHXrCmcXeRv7P08DVoUYeP7"
+API_KEY          = _env("KITE_API_KEY",      "API_KEY")
+ACCESS_TOKEN     = _env("KITE_ACCESS_TOKEN", "ACCESS_TOKEN")
 
 BASE_SYMBOL      = "NIFTY"
 EXCHANGE_FUT     = "NFO"
