@@ -49,11 +49,11 @@ IST = ZoneInfo("Asia/Kolkata")
 #  CONFIG
 # =============================================================================
 
-API_KEY          = "9qfecm39l1j64xyc"
-ACCESS_TOKEN     = "LY24Uy4cYIHXrCmcXeRv7P08DVoUYeP7"
+#API_KEY          = "9qfecm39l1j64xyc"
+#ACCESS_TOKEN     = "LY24Uy4cYIHXrCmcXeRv7P08DVoUYeP7"
 
-API_KEY          = _env("API_KEY",      "API_KEY")
-ACCESS_TOKEN     = _env("ACCESS_TOKEN", "ACCESS_TOKEN")
+API_KEY          = os.getenv("API_KEY", "").strip()
+ACCESS_TOKEN     = os.getenv("ACCESS_TOKEN", "").strip()
 
 BASE_SYMBOL      = "NIFTY"
 EXCHANGE_FUT     = "NFO"
